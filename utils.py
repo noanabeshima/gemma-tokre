@@ -3,35 +3,36 @@ import torch.nn as nn
 
 
 class JumpReLUSAE(nn.Module):
-  def __init__(self, d_model, d_sae):
-    # Note that we initialise these to zeros because we're loading in pre-trained weights.
-    # If you want to train your own SAEs then we recommend using blah
-    super().__init__()
-    self.W_enc = nn.Parameter(torch.zeros(d_model, d_sae))
-    self.W_dec = nn.Parameter(torch.zeros(d_sae, d_model))
-    self.threshold = nn.Parameter(torch.zeros(d_sae))
-    self.b_enc = nn.Parameter(torch.zeros(d_sae))
-    self.b_dec = nn.Parameter(torch.zeros(d_model))
+    def __init__(self, d_model, d_sae):
+        super().__init__()
+        self.W_enc = nn.Parameter(torch.zeros(d_model, d_sae))
+        self.W_dec = nn.Parameter(torch.zeros(d_sae, d_model))
+        self.threshold = nn.Parameter(torch.zeros(d_sae))
+        self.b_enc = nn.Parameter(torch.zeros(d_sae))
+        self.b_dec = nn.Parameter(torch.zeros(d_model))
 
-  def encode(self, input_acts, indices=None):
-    if indices is not None:
-        pre_acts = input_acts @ self.W_enc[:,indices] + self.b_enc[indices]
-        mask = (pre_acts > self.threshold[indices])
+    @torch.no_grad()
+    def encode(self, input_acts, indices=None):
+        if indices is not None:
+            pre_acts = input_acts @ self.W_enc[:,indices] + self.b_enc[indices]
+            mask = (pre_acts > self.threshold[indices])
+            acts = mask * torch.nn.functional.relu(pre_acts)
+            return acts
+        
+        pre_acts = input_acts @ self.W_enc + self.b_enc
+        mask = (pre_acts > self.threshold)
         acts = mask * torch.nn.functional.relu(pre_acts)
         return acts
-        
-    pre_acts = input_acts @ self.W_enc + self.b_enc
-    mask = (pre_acts > self.threshold)
-    acts = mask * torch.nn.functional.relu(pre_acts)
-    return acts
 
-  def decode(self, acts):
-    return acts @ self.W_dec + self.b_dec
+    @torch.no_grad()
+    def decode(self, acts):
+        return acts @ self.W_dec + self.b_dec
 
-  def forward(self, acts):
-    acts = self.encode(acts)
-    recon = self.decode(acts)
-    return recon
+    @torch.no_grad()
+    def forward(self, acts):
+        acts = self.encode(acts)
+        recon = self.decode(acts)
+        return recon
 
 import numpy as np
 
@@ -56,6 +57,7 @@ import torch
 # from utils import JumpReLUSAE
 
 def load_gemma_sae(type, layer, l0, width='65k'):
+    global lm
     assert type in {'mlp', 'att', 'res', 'transcoders'}
     repo_id = f'google/gemma-scope-2b-pt-{type}'
     sae_loc = f'layer_{layer}/width_{width}'
@@ -79,7 +81,7 @@ def load_gemma_sae(type, layer, l0, width='65k'):
     )
 
     params = np.load(path_to_params)
-    pt_params = {k: torch.from_numpy(v).cuda() for k, v in params.items()}
+    pt_params = {k: torch.from_numpy(v).to(lm.device) for k, v in params.items()}
 
 
     sae = JumpReLUSAE(params['W_enc'].shape[0], params['W_enc'].shape[1])
@@ -149,22 +151,21 @@ ds = load_dataset("HuggingFaceFW/fineweb-edu", "sample-10BT")
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
-from nnsight import NNsight
+# from nnsight import NNsight
 from utils import load_gemma_sae
 
 
-torch.set_grad_enabled(False)
 
 
 tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-2b")
-lm = AutoModelForCausalLM.from_pretrained("google/gemma-2-2b").to(torch.bfloat16).cuda()
+lm = AutoModelForCausalLM.from_pretrained("google/gemma-2-2b")#.to(torch.bfloat16).cuda()
 
 import numpy as np
 
 # tok_strs = np.array([tokenizer.decode([tok_id]).replace(' ', '·').replace('\n', '⤶') for tok_id in range(256000)])
 tok_strs = np.array([tokenizer.decode([tok_id]) for tok_id in range(256000)])
 
-
+@torch.no_grad()
 def get_acts(layer, l0, sae_type, width='16k', batch_size=200, indices=range(0,100), num_docs=10_000):
     global lm
 
@@ -180,7 +181,7 @@ def get_acts(layer, l0, sae_type, width='16k', batch_size=200, indices=range(0,1
     for i, batch in tqdm(enumerate(dataloader), total=num_batches):
         out = tokenizer(batch['text'], return_tensors='pt', padding=True, truncation=True, max_length=128)
         tok_ids, attn_mask = out['input_ids'], out['attention_mask']
-        tok_ids = tok_ids[attn_mask[:,0].bool()].cuda()
+        tok_ids = tok_ids[attn_mask[:,0].bool()].to(lm.device)
         
         try:
             lm.forward(tok_ids)
@@ -210,6 +211,7 @@ def get_acts(layer, l0, sae_type, width='16k', batch_size=200, indices=range(0,1
 
 import pysvelte
 
+@torch.no_grad()
 def see_acts(acts, toks, **kwargs):
     kwargs['start'] = kwargs.get('start', 0.8)
     kwargs['aggr'] = kwargs.get('aggr', 'signed_absmax')
